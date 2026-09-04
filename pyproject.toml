@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "universal-sdr-mcp"
+version = "1.0.0"
+description = "Universal SDR Model Context Protocol (MCP) Server for AI Agents"
+readme = "README.md"
+authors = [{ name = "ygud" }]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=0.1.0",
+]
+
+[project.scripts]
+universal-sdr-mcp = "sdr_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sdr_mcp*"]

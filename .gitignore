@@ -1,0 +1,19 @@
+# Build & dependencies
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+
+# SDR++ source clone (heavy external submodule)
+repos/
+
+# Compiled binaries & audio artifacts
+*.dylib
+*.so
+*.wav
+*.mp3
+
+# OS metadata
+.DS_Store
