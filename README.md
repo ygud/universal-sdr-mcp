@@ -58,6 +58,15 @@ Enables any MCP-compliant AI Agent (**Claude Desktop**, **AntiGravity**, **Curso
 
 ---
 
+## 🤖 Built-in AI Agent Skill (`skills/universal-sdr`)
+
+This repository is **fully self-contained** and includes the native AI Agent Skill:
+- **Skill Specification**: [`skills/universal-sdr/SKILL.md`](skills/universal-sdr/SKILL.md)
+
+Any coding agent (**Codex**, **Kimi**, **Claude Code**, **AntiGravity**) can read `skills/universal-sdr/SKILL.md` directly from this repo to autonomously monitor frequencies, analyze spectrum FFT bins, tune AM/USB/LSB, sample audio, deduce station identities, and update the SDR++ UI.
+
+---
+
 ## Installation & Requirements
 
 ### Prerequisites
@@ -151,6 +160,10 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```
 /Users/xanaduxuan/Documents/antigravity/sdr/
 ├── README.md                      # Project documentation (this file)
+├── pyproject.toml                 # Package definition (pip installable)
+├── skills/
+│   └── universal-sdr/
+│       └── SKILL.md               # AI Agent Skill (Codex / Kimi / Claude / AntiGravity)
 ├── plugins/
 │   └── sdrpp_agent/               # C++ Plugin for SDR++
 │       ├── CMakeLists.txt
