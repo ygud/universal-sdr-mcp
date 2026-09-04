@@ -166,5 +166,41 @@ def sdr_update_analysis(
     )
 
 
+@mcp.tool()
+def sdr_scan(
+    start_frequency: float,
+    end_frequency: float,
+    step_hz: Optional[float] = None,
+    dwell_ms: float = 150.0,
+    mode: Optional[str] = None,
+    min_snr_db: float = 6.0,
+    threshold_db: Optional[float] = None,
+    cluster_width_hz: float = 8000.0,
+) -> Dict[str, Any]:
+    """Perform an autonomous RF spectrum sweep across a frequency range to detect candidate signals.
+
+    Args:
+        start_frequency: Start frequency in Hz (e.g. 11000000 for 11.0 MHz)
+        end_frequency: End frequency in Hz (e.g. 12500000 for 12.5 MHz)
+        step_hz: Center frequency shift between windows in Hz. Defaults to 50% instantaneous bandwidth.
+        dwell_ms: Dwell time in milliseconds at each frequency window before sampling FFT (default 150ms)
+        mode: Optional demodulation mode during sweep (e.g. AM, USB, LSB)
+        min_snr_db: Minimum peak SNR above noise floor in dB (default 6.0 dB)
+        threshold_db: Optional absolute power threshold in dB (e.g. -70.0 dB)
+        cluster_width_hz: Maximum distance in Hz to cluster adjacent spectral peaks (default 8000 Hz)
+    """
+    return _active_backend.scan(
+        start_frequency=start_frequency,
+        end_frequency=end_frequency,
+        step_hz=step_hz,
+        dwell_ms=dwell_ms,
+        mode=mode,
+        min_snr_db=min_snr_db,
+        threshold_db=threshold_db,
+        cluster_width_hz=cluster_width_hz,
+    ).to_dict()
+
+
 if __name__ == "__main__":
     mcp.run()
+

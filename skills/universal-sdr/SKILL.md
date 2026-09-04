@@ -91,15 +91,16 @@ Always verify backend availability before executing RF actions:
   - If `false`, notify the user that SDR++ is not reachable on `127.0.0.1:19870`, or switch to mock mode via `sdr_switch_backend("mock")`.
   - If `true`, verify current frequency and modulation mode.
 
-### Step 2: Spectrum Power Inspection
-Inspect the passband FFT to detect active carriers:
-- Call `sdr_get_spectrum(bin_count=256)`.
-- Inspect `peak_db` vs `avg_db`:
-  - If `peak_db - avg_db > 10.0 dB`, a strong radio transmission is present at `peak_frequency`.
-  - Note the frequency offset from the current center.
+### Step 2: Autonomous Spectrum Sweep (`sdr_scan`)
+Perform an automated frequency sweep across a desired band to detect active candidate signals:
+- Call `sdr_scan(start_frequency=..., end_frequency=..., min_snr_db=6.0)`.
+- The tool sweeps the hardware LO with safe 50% overlap windowing, computes FFT, estimates the noise floor, clusters adjacent peaks, deduplicates cross-window candidates, and **guarantees restoration of the original receiver state** upon completion.
+- Inspect `res["candidates"]`:
+  - Each candidate contains `frequency`, `power_db`, `estimated_snr_db`, and `confidence`.
+  - Pick top candidates with high SNR / confidence for targeted inspection.
 
 ### Step 3: Precise Tuning
-Lock the demodulator onto the carrier:
+Lock the demodulator onto a detected candidate frequency:
 - Call `sdr_tune(frequency=TARGET_HZ, mode=MODE)`.
   - Common HF broadcast bands: Shortwave (5.9 – 18 MHz), AM mode.
   - Amateur radio: 7.050 MHz (LSB), 14.200 MHz (USB).
@@ -133,14 +134,16 @@ Push the deduction back to the user's SDR++ screen so the operator can view the 
 |---|---|---|---|
 | `sdr_status` | None | Queries receiver state, connection, and audio stream status. | `frequency`, `mode`, `connected`, `audio_ready`, `backend` |
 | `sdr_devices` | None | Lists available radio hardware sources. | `available_sources`, `active_device` |
+| `sdr_scan` | `start_frequency`, `end_frequency`, `step_hz=None`, `dwell_ms=150.0`, `mode=None`, `min_snr_db=6.0` | Autonomous RF spectrum sweep. Detects, clusters, and deduplicates candidate signals with state restoration. | `success`, `candidates: List[ScanCandidate]`, `window_count`, `noise_floor_db` |
 | `sdr_tune` | `frequency: float`, `mode: str = None` | Tunes SDR to center frequency in Hz and optional mode (`AM`, `WFM`, `NFM`, `USB`, `LSB`, `CW`). | `success`, `frequency`, `mode` |
-| `sdr_get_spectrum` | `bin_count: int = 256` | Returns real-time RF power spectrum FFT in dB. | `available`, `bins`, `peak_db`, `peak_frequency`, `avg_db` |
+| `sdr_get_spectrum` | `bin_count: int = 256` | Returns real-time RF power spectrum FFT in dB across instantaneous passband. | `available`, `bins`, `peak_db`, `peak_frequency`, `avg_db` |
 | `sdr_get_audio` | `duration_sec: float = 5.0`, `frequency: float = None`, `mode: str = None` | Samples demodulated audio to a WAV file with RMS and peak metrics. | `success`, `path`, `sample_rate`, `rms`, `peak` |
 | `sdr_start_recording` | `path: str = None` | Starts continuous audio recording to WAV. | `status: "started"`, `path` |
 | `sdr_stop_recording` | None | Stops continuous recording and finalizes WAV file. | `status: "stopped"`, `duration_sec`, `size_bytes` |
 | `sdr_switch_backend` | `backend_type: str` | Switches backend at runtime (`"sdrpp"` or `"mock"`). | `status: "ok"`, `active_backend` |
 | `sdr_update_analysis` | `country`, `language`, `station`, `program`, `confidence`, `evidence`, `dialect` | Pushes station identification results to SDR++ UI console. | `success: true` |
 | `sdr_set_gain` | `gain_db: float` | Reports `NOT_SUPPORTED` for SDR++ backend. | `supported: false`, `status: "NOT_SUPPORTED"` |
+
 
 ---
 

@@ -26,9 +26,27 @@ class TestMCPTools(unittest.TestCase):
             "sdr_stop_recording",
             "sdr_switch_backend",
             "sdr_update_analysis",
+            "sdr_scan",
         ]
         for exp in expected:
             self.assertIn(exp, tools, f"Missing registered tool {exp}")
+
+    def test_scan_tool(self):
+        res = srv.sdr_scan(
+            start_frequency=11000000.0,
+            end_frequency=12500000.0,
+            dwell_ms=10.0,
+            min_snr_db=6.0,
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(res["start_frequency"], 11000000.0)
+        self.assertEqual(res["end_frequency"], 12500000.0)
+        self.assertGreater(len(res["candidates"]), 0)
+        cand = res["candidates"][0]
+        self.assertIn("frequency", cand)
+        self.assertIn("power_db", cand)
+        self.assertIn("estimated_snr_db", cand)
+
 
     def test_update_analysis_tool(self):
         res = srv.sdr_update_analysis(

@@ -135,6 +135,15 @@ private:
     std::vector<std::string> analysisEvidence;
     std::string lastSampleTime = "None";
 
+    // Scan status
+    std::mutex scanMtx;
+    bool isScanning = false;
+    double scanStartFreq = 0.0;
+    double scanEndFreq = 0.0;
+    double scanCurFreq = 0.0;
+    int scanFoundCandidates = 0;
+    std::string scanStatus = "IDLE";
+
     // Audio stream & recording
     std::string currentStreamName = "";
     dsp::stream<dsp::stereo_t>* audioStream = nullptr;
@@ -360,6 +369,7 @@ private:
             else if (method == "sdr_tune" || method == "sdr.tune") {
                 double freq = params.value("frequency", 0.0);
                 std::string mode = params.value("mode", "");
+                bool center = params.value("center", false);
 
                 std::string vfo = gui::waterfall.selectedVFO;
                 if (vfo.empty() && !gui::waterfall.vfos.empty()) {
@@ -367,7 +377,11 @@ private:
                 }
 
                 if (!vfo.empty() && freq > 0) {
-                    tuner::normalTuning(vfo, freq);
+                    if (center) {
+                        tuner::centerTuning(vfo, freq);
+                    } else {
+                        tuner::normalTuning(vfo, freq);
+                    }
                 }
 
                 if (!mode.empty() && !vfo.empty() && core::modComManager.getModuleName(vfo) == "radio") {
@@ -388,7 +402,8 @@ private:
                 resp["result"] = {
                     {"success", true},
                     {"frequency", freq},
-                    {"mode", mode}
+                    {"mode", mode},
+                    {"center", center}
                 };
             }
             else if (method == "sdr_sample_audio" || method == "sdr.sample_audio") {
@@ -445,6 +460,12 @@ private:
                 };
             }
             else if (method == "sdr_get_spectrum" || method == "sdr.get_spectrum") {
+                // Ensure SDR playback is active so waterfall produces FFT data
+                if (!gui::mainWindow.isPlaying()) {
+                    gui::mainWindow.setPlayState(true);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+
                 int width = 0;
                 float* fftData = gui::waterfall.acquireLatestFFT(width);
                 if (!fftData || width <= 0) {
@@ -459,8 +480,8 @@ private:
                     float minDb = gui::waterfall.getFFTMin();
                     float maxDb = gui::waterfall.getFFTMax();
 
-                    // Downsample FFT bins to standard 256 points for compact network transport
-                    int targetBins = 256;
+                    // Downsample FFT bins to requested bin_count (default 256, clamped 16-4096)
+                    int targetBins = std::clamp(params.value("bin_count", 256), 16, 4096);
                     int step = std::max(1, width / targetBins);
                     std::vector<float> bins;
                     bins.reserve(targetBins);
@@ -612,6 +633,16 @@ private:
 
                 resp["result"] = {{"success", true}};
             }
+            else if (method == "sdr_update_scan_status" || method == "sdr.update_scan_status") {
+                std::lock_guard<std::mutex> lck(scanMtx);
+                scanStatus = params.value("status", "IDLE");
+                isScanning = (scanStatus == "SCANNING");
+                scanStartFreq = params.value("start_frequency", 0.0);
+                scanEndFreq = params.value("end_frequency", 0.0);
+                scanCurFreq = params.value("current_frequency", 0.0);
+                scanFoundCandidates = params.value("found_candidates", 0);
+                resp["result"] = {{"success", true}};
+            }
             else if (method == "sdr_health") {
                 resp["result"] = {
                     {"status", "ok"},
@@ -646,6 +677,20 @@ private:
         }
 
         ImGui::Separator();
+
+        // Scan status indicator
+        {
+            std::lock_guard<std::mutex> lck(_this->scanMtx);
+            if (_this->isScanning) {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "● SCANNING RF SPECTRUM...");
+                ImGui::Text("Range: %.1f - %.1f kHz", _this->scanStartFreq / 1000.0, _this->scanEndFreq / 1000.0);
+                ImGui::Text("Current: %.1f kHz | Found: %d", _this->scanCurFreq / 1000.0, _this->scanFoundCandidates);
+                ImGui::Separator();
+            } else if (_this->scanStatus == "COMPLETE") {
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "✓ SCAN COMPLETE (Candidates: %d)", _this->scanFoundCandidates);
+                ImGui::Separator();
+            }
+        }
 
         // Current Hardware Status
         double curFreq = gui::waterfall.getCenterFrequency();

@@ -100,7 +100,7 @@ python3 -m sdr_mcp --backend sdrpp
 ```bash
 python3 -m unittest discover -s sdr_mcp/tests
 ```
-(Runs all 25 unit tests across Mock backend, SDR++ live IPC bridge, and MCP tools).
+(Runs all 41 unit tests across Peak Detection & Clustering, Mock Spectrum Sweep, SDR++ live IPC bridge, and MCP tools).
 
 ---
 
@@ -143,6 +143,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 |-----------|-----------|-------------|---------------|
 | `sdr_status` | None | Queries current receiver state, tuned frequency, mode, and audio stream status. | `frequency`, `frequency_khz`, `mode`, `audio_ready`, `connected`, `backend` |
 | `sdr_devices` | None | Lists available radio hardware sources and input drivers. | `available_sources`, `active_device`, `count` |
+| `sdr_scan` | `start_frequency: float`, `end_frequency: float`, `step_hz: float = None`, `dwell_ms: float = 150.0`, `mode: str = None`, `min_snr_db: float = 6.0`, `threshold_db: float = None`, `cluster_width_hz: float = 8000.0` | Autonomous RF spectrum sweep. Steps hardware LO with safe 50% overlap, acquires FFT, computes noise floor, clusters peaks, deduplicates candidates, and guarantees state restoration. | `success`, `start_frequency`, `end_frequency`, `window_count`, `elapsed_sec`, `noise_floor_db`, `candidates: List[ScanCandidate]`, `details` |
 | `sdr_tune` | `frequency: float`, `mode: str = None` | Tunes SDR to center frequency (Hz) and optionally sets modulation (`AM`, `WFM`, `NFM`, `USB`, `LSB`, `CW`). | `success`, `frequency`, `mode` |
 | `sdr_get_spectrum` | `bin_count: int = 256` | Returns real-time RF power spectrum FFT data (in dB) across passband. | `available`, `bins: List[float]`, `peak_db`, `peak_frequency`, `avg_db` |
 | `sdr_get_audio` | `duration_sec: float = 5.0`, `frequency: float = None`, `mode: str = None` | Samples live demodulated audio segment to a WAV file on host. Computes RMS and peak levels. | `success`, `path`, `duration_sec`, `sample_rate`, `samples_recorded`, `rms`, `peak` |
@@ -173,15 +174,18 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 │   ├── __init__.py
 │   ├── __main__.py                # CLI entry point (--backend, --transport, --port)
 │   ├── server.py                  # FastMCP tools definition
+│   ├── detector.py                # Spectrum peak detector, clustering & deduplication
 │   ├── backend/
 │   │   ├── __init__.py            # Backend factory (get_backend)
 │   │   ├── base.py                # Abstract SDRBackend ABC and dataclasses
-│   │   ├── sdrpp.py               # Live SDR++ TCP JSON-RPC bridge
-│   │   └── mock.py                # Pure software simulation backend
+│   │   ├── sdrpp.py               # Live SDR++ TCP JSON-RPC bridge (RF sweep & lock)
+│   │   └── mock.py                # Pure software simulation backend (synthetic signals)
 │   └── tests/
+│       ├── test_detector.py       # Peak detector & clustering unit tests (6 tests)
 │       ├── test_mock_backend.py   # Mock backend unit tests (7 tests)
+│       ├── test_mock_scan.py      # Mock RF sweep & state restoration tests (9 tests)
 │       ├── test_sdrpp_backend.py  # Real SDR++ live IPC tests (8 tests)
-│       └── test_mcp_tools.py      # MCP schema & tool invocation tests (10 tests)
+│       └── test_mcp_tools.py      # MCP schema & tool invocation tests (11 tests)
 └── repos/
     └── SDRPlusPlus/               # SDR++ source tree (used for plugin header compilation)
 ```

@@ -11,6 +11,7 @@ import time
 import wave
 import struct
 import math
+import threading
 from typing import Optional, Dict, Any, List
 
 from sdr_mcp.backend.base import (
@@ -19,6 +20,15 @@ from sdr_mcp.backend.base import (
     SpectrumData,
     AudioSegment,
     RecordingInfo,
+    ScanCandidate,
+    ScanResult,
+)
+from sdr_mcp.detector import (
+    estimate_noise_floor,
+    detect_peaks_in_window,
+    cluster_adjacent_peaks,
+    deduplicate_candidates,
+    filter_scan_range,
 )
 
 DEFAULT_IPC_HOST = os.environ.get("SDR_IPC_HOST", "127.0.0.1")
@@ -32,6 +42,8 @@ class SdrppBackend(SDRBackend):
     def __init__(self, host: str = DEFAULT_IPC_HOST, port: int = DEFAULT_IPC_PORT):
         self.host = host
         self.port = port
+        self._scan_lock = threading.Lock()
+        self._is_scanning = False
 
     @property
     def name(self) -> str:
@@ -128,8 +140,16 @@ class SdrppBackend(SDRBackend):
             "count": res.get("count", 0),
         }
 
-    def tune(self, frequency: float, mode: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"frequency": frequency}
+    def tune(
+        self,
+        frequency: float,
+        mode: Optional[str] = None,
+        center: bool = False,
+        internal: bool = False,
+    ) -> Dict[str, Any]:
+        if not internal and self._is_scanning:
+            return {"backend": self.name, "success": False, "error": "Hardware busy: SDR scan in progress"}
+        params: Dict[str, Any] = {"frequency": frequency, "center": center}
         if mode:
             params["mode"] = mode.upper()
         res = self._rpc_call("sdr_tune", params, timeout=4.0)
@@ -140,6 +160,7 @@ class SdrppBackend(SDRBackend):
             "success": bool(res.get("success", False)),
             "frequency": res.get("frequency", frequency),
             "mode": res.get("mode", mode or "UNCHANGED"),
+            "center": bool(res.get("center", center)),
         }
 
     def set_gain(self, gain_db: float) -> Dict[str, Any]:
@@ -155,7 +176,7 @@ class SdrppBackend(SDRBackend):
         return res
 
     def get_spectrum(self, bin_count: int = 256) -> SpectrumData:
-        res = self._rpc_call("sdr_get_spectrum", timeout=3.0)
+        res = self._rpc_call("sdr_get_spectrum", {"bin_count": bin_count}, timeout=3.0)
         if "error" in res or not res.get("available", False):
             err_msg = res.get("error", "Spectrum data unavailable")
             return SpectrumData(
@@ -198,6 +219,18 @@ class SdrppBackend(SDRBackend):
         frequency: Optional[float] = None,
         mode: Optional[str] = None,
     ) -> AudioSegment:
+        if self._is_scanning:
+            return AudioSegment(
+                success=False,
+                path="",
+                duration_sec=0.0,
+                sample_rate=48000,
+                channels=1,
+                samples_recorded=0,
+                backend=self.name,
+                simulated=False,
+                error="Hardware busy: SDR scan in progress",
+            )
         if frequency is not None:
             self.tune(frequency, mode)
             time.sleep(0.3)
@@ -319,3 +352,205 @@ class SdrppBackend(SDRBackend):
         if "error" in res:
             return {"backend": self.name, "success": False, "error": res["error"]}
         return {"backend": self.name, "success": bool(res.get("success", False))}
+
+    def update_scan_status(
+        self,
+        scanning: bool,
+        current_freq: float = 0.0,
+        progress: float = 0.0,
+        candidates_count: int = 0,
+        status_text: str = "",
+        error_message: str = "",
+    ) -> Dict[str, Any]:
+        params = {
+            "status": "SCANNING" if scanning else ("COMPLETE" if "COMPLETE" in status_text.upper() else "IDLE"),
+            "scanning": scanning,
+            "current_frequency": current_freq,
+            "progress": progress,
+            "found_candidates": candidates_count,
+            "status_text": status_text,
+            "error_message": error_message,
+        }
+        res = self._rpc_call("sdr_update_scan_status", params, timeout=2.0)
+        if "error" in res:
+            return {"backend": self.name, "success": False, "error": res["error"]}
+        return {"backend": self.name, "success": bool(res.get("success", True))}
+
+    def scan(
+        self,
+        start_frequency: float,
+        end_frequency: float,
+        step_hz: Optional[float] = None,
+        dwell_ms: float = 150.0,
+        mode: Optional[str] = None,
+        min_snr_db: float = 6.0,
+        threshold_db: Optional[float] = None,
+        cluster_width_hz: float = 8000.0,
+    ) -> ScanResult:
+        if end_frequency <= start_frequency:
+            raise ValueError(f"end_frequency ({end_frequency}) must be greater than start_frequency ({start_frequency})")
+
+        with self._scan_lock:
+            if self._is_scanning:
+                return ScanResult(
+                    success=False,
+                    start_frequency=start_frequency,
+                    end_frequency=end_frequency,
+                    window_count=0,
+                    elapsed_sec=0.0,
+                    error="SDR is currently busy scanning",
+                )
+            self._is_scanning = True
+
+        start_time = time.time()
+        orig_status = self.get_status()
+        if not orig_status.connected:
+            self._is_scanning = False
+            return ScanResult(
+                success=False,
+                start_frequency=start_frequency,
+                end_frequency=end_frequency,
+                window_count=0,
+                elapsed_sec=0.0,
+                error="SDR++ backend is disconnected",
+            )
+
+        orig_freq = orig_status.frequency
+        orig_mode = orig_status.mode
+
+        # Query initial spectrum to detect actual hardware bandwidth
+        spec0 = self.get_spectrum(bin_count=256)
+        if spec0.available and spec0.bandwidth > 0:
+            window_bw = spec0.bandwidth
+        else:
+            window_bw = 2048000.0  # Safe default 2.048 MHz
+
+        max_step = window_bw * 0.5  # Safe 50% overlap rule
+        warning = None
+        if step_hz is None:
+            step_hz = max_step
+        elif step_hz > max_step:
+            warning = f"Requested step_hz {step_hz} exceeds safe 50% overlap limit ({max_step}); clamped to {max_step}."
+            step_hz = max_step
+
+        span = end_frequency - start_frequency
+        if span <= step_hz:
+            window_centers = [(start_frequency + end_frequency) / 2.0]
+        else:
+            first_center = start_frequency + step_hz / 2.0
+            window_centers = []
+            curr = first_center
+            while (curr - step_hz / 2.0) < end_frequency:
+                window_centers.append(curr)
+                curr += step_hz
+
+        all_raw_candidates: List[Dict[str, Any]] = []
+        failed_windows: List[Dict[str, Any]] = []
+        measured_noise_floors: List[float] = []
+
+        try:
+            total_windows = len(window_centers)
+            for idx, center_f in enumerate(window_centers):
+                self.update_scan_status(
+                    scanning=True,
+                    current_freq=center_f,
+                    progress=round(idx / max(1, total_windows), 2),
+                    candidates_count=len(all_raw_candidates),
+                    status_text=f"Scanning window {idx + 1}/{total_windows}",
+                )
+
+                # Tune with center=True, internal=True
+                t_res = self.tune(center_f, mode=mode, center=True, internal=True)
+                if not t_res.get("success", False):
+                    failed_windows.append({
+                        "window_idx": idx,
+                        "center_freq": center_f,
+                        "error": t_res.get("error", "Tune failed"),
+                    })
+                    continue  # MUST NOT use stale data from previous window!
+
+                # Dwell
+                if dwell_ms > 0:
+                    time.sleep(dwell_ms / 1000.0)
+
+                # Acquire spectrum
+                spec = self.get_spectrum(bin_count=512)
+                if not spec.available or not spec.bins:
+                    failed_windows.append({
+                        "window_idx": idx,
+                        "center_freq": center_f,
+                        "error": "Spectrum acquisition failed",
+                    })
+                    continue
+
+                nf = estimate_noise_floor(spec.bins)
+                measured_noise_floors.append(nf)
+                step_per_bin = spec.bandwidth / len(spec.bins)
+                peaks = detect_peaks_in_window(
+                    bins=spec.bins,
+                    start_freq=spec.start_frequency,
+                    step_hz=step_per_bin,
+                    noise_floor_db=nf,
+                    min_snr_db=min_snr_db,
+                    threshold_db=threshold_db,
+                )
+                cands = cluster_adjacent_peaks(peaks, cluster_width_hz=cluster_width_hz)
+                all_raw_candidates.extend(cands)
+
+            # Deduplicate across overlapping windows
+            deduped = deduplicate_candidates(all_raw_candidates, min_distance_hz=cluster_width_hz * 0.75)
+            # Filter strictly within requested range [start_frequency, end_frequency]
+            final_cands_dict = filter_scan_range(deduped, start_frequency, end_frequency)
+
+            scan_candidates = [
+                ScanCandidate(
+                    frequency=c["frequency"],
+                    power_db=c["power_db"],
+                    estimated_snr_db=c["estimated_snr_db"],
+                    bandwidth_hz=c["bandwidth_hz"],
+                    confidence=c["confidence"],
+                )
+                for c in final_cands_dict
+            ]
+
+            avg_nf = round(sum(measured_noise_floors) / len(measured_noise_floors), 1) if measured_noise_floors else -100.0
+            elapsed = round(time.time() - start_time, 2)
+
+            is_success = len(failed_windows) < total_windows
+            err_msg = "All scan windows failed" if not is_success else None
+
+            details: Dict[str, Any] = {
+                "step_hz": step_hz,
+                "window_bandwidth": window_bw,
+                "simulated": False,
+            }
+            if failed_windows:
+                details["failed_windows"] = failed_windows
+            if warning:
+                details["warning"] = warning
+
+            return ScanResult(
+                success=is_success,
+                start_frequency=start_frequency,
+                end_frequency=end_frequency,
+                window_count=total_windows,
+                elapsed_sec=elapsed,
+                candidates=scan_candidates,
+                noise_floor_db=avg_nf,
+                details=details,
+                error=err_msg,
+            )
+
+        finally:
+            # RESTORATION GUARANTEE: restore original center frequency and mode
+            try:
+                if orig_freq > 0:
+                    self.tune(orig_freq, mode=orig_mode, center=True, internal=True)
+                self.update_scan_status(
+                    scanning=False,
+                    status_text="SCAN COMPLETE",
+                    candidates_count=len(all_raw_candidates),
+                )
+            finally:
+                self._is_scanning = False
+
