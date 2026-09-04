@@ -355,20 +355,28 @@ class SdrppBackend(SDRBackend):
 
     def update_scan_status(
         self,
-        scanning: bool,
-        current_freq: float = 0.0,
+        status: str = "IDLE",
+        scanning: bool = False,
+        start_frequency: float = 0.0,
+        end_frequency: float = 0.0,
+        current_frequency: float = 0.0,
         progress: float = 0.0,
-        candidates_count: int = 0,
-        status_text: str = "",
+        found_candidates: int = 0,
+        noise_floor_db: float = -100.0,
+        candidates: Optional[List[Dict[str, Any]]] = None,
         error_message: str = "",
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         params = {
-            "status": "SCANNING" if scanning else ("COMPLETE" if "COMPLETE" in status_text.upper() else "IDLE"),
-            "scanning": scanning,
-            "current_frequency": current_freq,
+            "status": status,
+            "scanning": scanning or (status == "SCANNING"),
+            "start_frequency": start_frequency,
+            "end_frequency": end_frequency,
+            "current_frequency": current_frequency,
             "progress": progress,
-            "found_candidates": candidates_count,
-            "status_text": status_text,
+            "found_candidates": found_candidates,
+            "noise_floor_db": noise_floor_db,
+            "candidates": candidates if candidates is not None else [],
             "error_message": error_message,
         }
         res = self._rpc_call("sdr_update_scan_status", params, timeout=2.0)
@@ -418,6 +426,17 @@ class SdrppBackend(SDRBackend):
         orig_freq = orig_status.frequency
         orig_mode = orig_status.mode
 
+        # Reset previous UI results when a new scan starts
+        self.update_scan_status(
+            status="SCANNING",
+            scanning=True,
+            start_frequency=start_frequency,
+            end_frequency=end_frequency,
+            current_frequency=start_frequency,
+            found_candidates=0,
+            candidates=[],
+        )
+
         # Query initial spectrum to detect actual hardware bandwidth
         spec0 = self.get_spectrum(bin_count=256)
         if spec0.available and spec0.bandwidth > 0:
@@ -447,16 +466,19 @@ class SdrppBackend(SDRBackend):
         all_raw_candidates: List[Dict[str, Any]] = []
         failed_windows: List[Dict[str, Any]] = []
         measured_noise_floors: List[float] = []
+        scan_completed = False
 
         try:
             total_windows = len(window_centers)
             for idx, center_f in enumerate(window_centers):
                 self.update_scan_status(
+                    status="SCANNING",
                     scanning=True,
-                    current_freq=center_f,
+                    start_frequency=start_frequency,
+                    end_frequency=end_frequency,
+                    current_frequency=center_f,
                     progress=round(idx / max(1, total_windows), 2),
-                    candidates_count=len(all_raw_candidates),
-                    status_text=f"Scanning window {idx + 1}/{total_windows}",
+                    found_candidates=len(all_raw_candidates),
                 )
 
                 # Tune with center=True, internal=True
@@ -519,6 +541,41 @@ class SdrppBackend(SDRBackend):
             is_success = len(failed_windows) < total_windows
             err_msg = "All scan windows failed" if not is_success else None
 
+            # Sync completed candidates back to SDR++ Agent Console
+            candidate_dicts = [
+                {
+                    "frequency": c.frequency,
+                    "snr_db": c.estimated_snr_db,
+                    "power_db": c.power_db,
+                    "bandwidth_hz": c.bandwidth_hz,
+                    "confidence": c.confidence,
+                    "status": "Candidate",
+                }
+                for c in scan_candidates
+            ]
+
+            if is_success:
+                self.update_scan_status(
+                    status="COMPLETE",
+                    scanning=False,
+                    start_frequency=start_frequency,
+                    end_frequency=end_frequency,
+                    noise_floor_db=avg_nf,
+                    found_candidates=len(scan_candidates),
+                    candidates=candidate_dicts,
+                )
+                scan_completed = True
+            else:
+                self.update_scan_status(
+                    status="FAILED",
+                    scanning=False,
+                    start_frequency=start_frequency,
+                    end_frequency=end_frequency,
+                    error_message=err_msg or "Scan failed",
+                    candidates=[],
+                )
+                scan_completed = True
+
             details: Dict[str, Any] = {
                 "step_hz": step_hz,
                 "window_bandwidth": window_bw,
@@ -546,11 +603,15 @@ class SdrppBackend(SDRBackend):
             try:
                 if orig_freq > 0:
                     self.tune(orig_freq, mode=orig_mode, center=True, internal=True)
-                self.update_scan_status(
-                    scanning=False,
-                    status_text="SCAN COMPLETE",
-                    candidates_count=len(all_raw_candidates),
-                )
+                if not scan_completed:
+                    self.update_scan_status(
+                        status="FAILED",
+                        scanning=False,
+                        start_frequency=start_frequency,
+                        end_frequency=end_frequency,
+                        error_message="Scan aborted or encountered unhandled exception",
+                        candidates=[],
+                    )
             finally:
                 self._is_scanning = False
 

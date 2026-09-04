@@ -135,14 +135,53 @@ private:
     std::vector<std::string> analysisEvidence;
     std::string lastSampleTime = "None";
 
-    // Scan status
+    // Scan candidate data structure
+    struct ScanCandidateItem {
+        double frequency = 0.0;
+        float snr_db = 0.0f;
+        float power_db = -100.0f;
+        float bandwidth_hz = 0.0f;
+        float confidence = 0.0f;
+        std::string status = "Candidate";
+    };
+
+    enum CandidateAction {
+        CAND_ACTION_TUNE,
+        CAND_ACTION_LISTEN,
+        CAND_ACTION_ANALYZE,
+        CAND_ACTION_IDENTIFY
+    };
+
+    // Scan status & candidates
     std::mutex scanMtx;
     bool isScanning = false;
     double scanStartFreq = 0.0;
     double scanEndFreq = 0.0;
     double scanCurFreq = 0.0;
+    double scanNoiseFloorDb = -100.0;
     int scanFoundCandidates = 0;
     std::string scanStatus = "IDLE";
+    std::string scanErrorMessage = "";
+    std::vector<ScanCandidateItem> scanCandidates;
+    double selectedCandidateFreq = 0.0;
+    std::string lastTunedCandidateInfo = "";
+
+    void executeCandidateAction(CandidateAction action, const ScanCandidateItem& cand) {
+        if (action == CAND_ACTION_TUNE) {
+            std::string vfo = gui::waterfall.selectedVFO;
+            if (vfo.empty() && !gui::waterfall.vfos.empty()) {
+                vfo = gui::waterfall.vfos.begin()->first;
+            }
+            if (!vfo.empty() && cand.frequency > 0) {
+                tuner::normalTuning(vfo, cand.frequency);
+                selectedCandidateFreq = cand.frequency;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Tuned to %.4f MHz", cand.frequency / 1e6);
+                lastTunedCandidateInfo = buf;
+            }
+        }
+        // Future extensions: CAND_ACTION_LISTEN, CAND_ACTION_ANALYZE, CAND_ACTION_IDENTIFY
+    }
 
     // Audio stream & recording
     std::string currentStreamName = "";
@@ -633,15 +672,51 @@ private:
 
                 resp["result"] = {{"success", true}};
             }
-            else if (method == "sdr_update_scan_status" || method == "sdr.update_scan_status") {
+            else if (method == "sdr_update_scan_status" || method == "sdr.update_scan_status" ||
+                     method == "sdr_sync_scan_result" || method == "sdr.sync_scan_result") {
                 std::lock_guard<std::mutex> lck(scanMtx);
                 scanStatus = params.value("status", "IDLE");
                 isScanning = (scanStatus == "SCANNING");
                 scanStartFreq = params.value("start_frequency", 0.0);
                 scanEndFreq = params.value("end_frequency", 0.0);
                 scanCurFreq = params.value("current_frequency", 0.0);
+                scanNoiseFloorDb = params.value("noise_floor_db", -100.0);
                 scanFoundCandidates = params.value("found_candidates", 0);
-                resp["result"] = {{"success", true}};
+                scanErrorMessage = params.value("error_message", "");
+
+                if (scanStatus == "SCANNING") {
+                    scanCandidates.clear();
+                    selectedCandidateFreq = 0.0;
+                    lastTunedCandidateInfo = "";
+                } else if (scanStatus == "FAILED") {
+                    scanCandidates.clear();
+                    selectedCandidateFreq = 0.0;
+                } else if (params.contains("candidates") && params["candidates"].is_array()) {
+                    scanCandidates.clear();
+                    for (const auto& c : params["candidates"]) {
+                        ScanCandidateItem item;
+                        item.frequency = c.value("frequency", 0.0);
+                        item.snr_db = c.value("snr_db", 0.0f);
+                        item.power_db = c.value("power_db", -100.0f);
+                        if (c.contains("bandwidth_hz") && !c["bandwidth_hz"].is_null()) {
+                            item.bandwidth_hz = c["bandwidth_hz"].get<float>();
+                        }
+                        item.confidence = c.value("confidence", 0.0f);
+                        item.status = c.value("status", "Candidate");
+                        scanCandidates.push_back(item);
+                    }
+                    // Sort descending by SNR
+                    std::sort(scanCandidates.begin(), scanCandidates.end(), [](const ScanCandidateItem& a, const ScanCandidateItem& b) {
+                        return a.snr_db > b.snr_db;
+                    });
+                    scanFoundCandidates = (int)scanCandidates.size();
+                }
+
+                resp["result"] = {
+                    {"success", true},
+                    {"status", scanStatus},
+                    {"candidate_count", (int)scanCandidates.size()}
+                };
             }
             else if (method == "sdr_health") {
                 resp["result"] = {
@@ -678,16 +753,91 @@ private:
 
         ImGui::Separator();
 
-        // Scan status indicator
+        // Scan status & results indicator
         {
             std::lock_guard<std::mutex> lck(_this->scanMtx);
             if (_this->isScanning) {
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "● SCANNING RF SPECTRUM...");
-                ImGui::Text("Range: %.1f - %.1f kHz", _this->scanStartFreq / 1000.0, _this->scanEndFreq / 1000.0);
-                ImGui::Text("Current: %.1f kHz | Found: %d", _this->scanCurFreq / 1000.0, _this->scanFoundCandidates);
+                ImGui::Text("Range: %.4f - %.4f MHz", _this->scanStartFreq / 1e6, _this->scanEndFreq / 1e6);
+                ImGui::Text("Current: %.4f MHz | Found: %d", _this->scanCurFreq / 1e6, _this->scanFoundCandidates);
+                ImGui::Separator();
+            } else if (_this->scanStatus == "FAILED") {
+                ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "✗ SCAN FAILED");
+                if (!_this->scanErrorMessage.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Reason: %s", _this->scanErrorMessage.c_str());
+                }
                 ImGui::Separator();
             } else if (_this->scanStatus == "COMPLETE") {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "✓ SCAN COMPLETE (Candidates: %d)", _this->scanFoundCandidates);
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "=== Scan Result ===");
+                ImGui::Text("Coverage: %.4f–%.4f MHz", _this->scanStartFreq / 1e6, _this->scanEndFreq / 1e6);
+                ImGui::Text("Candidates: %d  |  Noise floor: %.1f dB", (int)_this->scanCandidates.size(), _this->scanNoiseFloorDb);
+
+                if (!_this->lastTunedCandidateInfo.empty()) {
+                    ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), ">> %s", _this->lastTunedCandidateInfo.c_str());
+                }
+
+                if (_this->scanCandidates.empty()) {
+                    ImGui::TextDisabled("No RF candidates detected above threshold.");
+                } else {
+                    float tableHeight = std::min(220.0f, 26.0f * (float)(_this->scanCandidates.size() + 1));
+                    if (ImGui::BeginTable("##ScanCandidatesTable", 4,
+                                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                                          ImVec2(0, tableHeight))) {
+                        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+                        ImGui::TableSetupColumn("Frequency", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("SNR", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+                        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+                        ImGui::TableSetupScrollFreeze(4, 1);
+                        ImGui::TableHeadersRow();
+
+                        for (size_t i = 0; i < _this->scanCandidates.size(); ++i) {
+                            const auto& cand = _this->scanCandidates[i];
+                            ImGui::TableNextRow();
+
+                            // Column 0: Index
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%d", (int)(i + 1));
+
+                            // Column 1: Frequency (Selectable spanning row)
+                            ImGui::TableSetColumnIndex(1);
+                            char freqBuf[64];
+                            snprintf(freqBuf, sizeof(freqBuf), "%.4f MHz", cand.frequency / 1e6);
+
+                            bool isSelected = (std::abs(_this->selectedCandidateFreq - cand.frequency) < 1.0);
+                            char selectableId[64];
+                            snprintf(selectableId, sizeof(selectableId), "%s##cand_%zu", freqBuf, i);
+
+                            bool clicked = ImGui::Selectable(selectableId, isSelected, ImGuiSelectableFlags_SpanAllColumns);
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::SetTooltip("Tune to %.4f MHz (%.1f kHz)\nPower: %.1f dB | Conf: %.0f%%\nClick to jump to candidate",
+                                                  cand.frequency / 1e6, cand.frequency / 1e3, cand.power_db, cand.confidence * 100.0f);
+                            }
+
+                            // Column 2: SNR
+                            ImGui::TableSetColumnIndex(2);
+                            if (cand.snr_db >= 10.0f) {
+                                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "+%.1f dB", cand.snr_db);
+                            } else if (cand.snr_db >= 6.0f) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "+%.1f dB", cand.snr_db);
+                            } else {
+                                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "+%.1f dB", cand.snr_db);
+                            }
+
+                            // Column 3: Action Button
+                            ImGui::TableSetColumnIndex(3);
+                            char btnId[32];
+                            snprintf(btnId, sizeof(btnId), "Tune##btn_%zu", i);
+                            if (ImGui::SmallButton(btnId)) {
+                                clicked = true;
+                            }
+
+                            if (clicked) {
+                                _this->executeCandidateAction(CAND_ACTION_TUNE, cand);
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                }
                 ImGui::Separator();
             }
         }
@@ -777,8 +927,8 @@ private:
         ImGui::Checkbox("Floating Console Window", &_this->showFloatingConsole);
 
         if (_this->showFloatingConsole) {
-            ImGui::SetNextWindowSize(ImVec2(380, 560), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowPos(ImVec2(860, 90), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(420, 680), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos(ImVec2(840, 60), ImGuiCond_FirstUseEver);
             if (ImGui::Begin("SDR++ AI Agent Console", &_this->showFloatingConsole)) {
                 drawConsoleWidgets(_this);
             }

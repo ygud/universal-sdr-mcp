@@ -206,12 +206,18 @@ class SDRBackend(ABC):
 
     def update_scan_status(
         self,
-        scanning: bool,
-        current_freq: float = 0.0,
+        status: str = "IDLE",
+        scanning: bool = False,
+        start_frequency: float = 0.0,
+        end_frequency: float = 0.0,
+        current_frequency: float = 0.0,
         progress: float = 0.0,
-        candidates_count: int = 0,
-        status_text: str = "",
+        found_candidates: int = 0,
+        noise_floor_db: float = -100.0,
+        candidates: Optional[List[Dict[str, Any]]] = None,
         error_message: str = "",
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Update UI / console with live scanning progress."""
+        """Update UI / console with scan status, progress, or completed candidate results."""
         return {"backend": self.name, "supported": False}
+
