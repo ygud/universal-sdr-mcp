@@ -201,6 +201,37 @@ def sdr_scan(
     ).to_dict()
 
 
+@mcp.tool()
+def sdr_screen_signals(
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    max_probes: int = 12,
+    probe_duration_sec: float = 1.0,
+    min_score_threshold: float = 0.35,
+    preserve_uncertain: bool = True,
+) -> Dict[str, Any]:
+    """Perform algorithmic pre-screening on RF scan candidates to filter out static noise and unmodulated spurs.
+    
+    Reduces large candidate lists (150-200 raw peaks) down to a compact list (3-10 channels)
+    of genuine, active broadcast signals (BROADCAST_ACTIVE / UNCERTAIN) ready for LLM investigation.
+    
+    Args:
+        candidates: Optional list of raw RF candidate dicts. If omitted, uses candidates from the most recent sdr_scan.
+        max_probes: Maximum number of top RF candidates to probe (default: 12).
+        probe_duration_sec: Duration in seconds for short audio probe (default: 1.0s).
+        min_score_threshold: Minimum broadcast score [0.0 - 1.0] to retain signals (default: 0.35).
+        preserve_uncertain: If True, retains all ambiguous/fading signals classified as UNCERTAIN (Recall-First policy).
+    """
+    clamped_probes = max(1, min(50, max_probes))
+    clamped_dur = max(0.5, min(5.0, probe_duration_sec))
+    return _active_backend.screen_candidates(
+        candidates=candidates,
+        max_probes=clamped_probes,
+        probe_duration_sec=clamped_dur,
+        min_score_threshold=min_score_threshold,
+        preserve_uncertain=preserve_uncertain,
+    ).to_dict()
+
+
 if __name__ == "__main__":
     mcp.run()
 

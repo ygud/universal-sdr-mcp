@@ -79,9 +79,9 @@ Configure the MCP client in your agent configuration file (e.g. `claude_desktop_
 When assigned a radio monitoring or station hunting task, follow this deterministic 6-step loop:
 
 ```
-[1. Status Check] ──> [2. Spectrum Scan] ──> [3. Tune & Lock]
+[1. Status Check] ──> [2. Spectrum Scan] ──> [3. Screen Signals]
                                                      │
-[6. Sync UI] <── [5. Multimodal Identify] <── [4. Sample Audio]
+[7. Sync UI] <── [6. Multimodal Identify] <── [5. Sample Audio] <── [4. Tune & Lock]
 ```
 
 ### Step 1: Health & Connection Verification
@@ -95,33 +95,41 @@ Always verify backend availability before executing RF actions:
 Perform an automated frequency sweep across a desired band to detect active candidate signals:
 - Call `sdr_scan(start_frequency=..., end_frequency=..., min_snr_db=6.0)`.
 - The tool sweeps the hardware LO with safe 50% overlap windowing, computes FFT, estimates the noise floor, clusters adjacent peaks, deduplicates cross-window candidates, and **guarantees restoration of the original receiver state** upon completion.
-- Inspect `res["candidates"]`:
-  - Each candidate contains `frequency`, `power_db`, `estimated_snr_db`, and `confidence`.
-  - Pick top candidates with high SNR / confidence for targeted inspection.
+- Returns raw RF candidates with frequency, power, and SNR.
 
-### Step 3: Precise Tuning
-Lock the demodulator onto a detected candidate frequency:
+### Step 3: Algorithmic Pre-Screening (`sdr_screen_signals`)
+Filter hundreds of raw RF candidates down to a compact list of genuine, active broadcast signals without overwhelming the LLM context:
+- Call `sdr_screen_signals(max_probes=12, probe_duration_sec=1.0)`.
+- Performs fast local spectrum re-validation and acoustic modulation dynamics checks.
+- Returns four-state classification:
+  - `BROADCAST_ACTIVE`: High-confidence broadcast with active speech/music dynamics.
+  - `UNCERTAIN`: Possible speech pause, channel fading, or weak broadcast (preserved for investigation under Recall-First policy).
+  - `CARRIER_ONLY`: Unmodulated carrier or local spur.
+  - `NOISE_STATIC`: Background noise (automatically filtered out).
+
+### Step 4: Precise Tuning
+Lock the demodulator onto a selected active candidate frequency:
 - Call `sdr_tune(frequency=TARGET_HZ, mode=MODE)`.
   - Common HF broadcast bands: Shortwave (5.9 – 18 MHz), AM mode.
   - Amateur radio: 7.050 MHz (LSB), 14.200 MHz (USB).
   - FM broadcast: 88.0 – 108.0 MHz, WFM mode.
 
-### Step 4: Audio Sampling & SNR Verification
-Capture a short demodulated segment to verify signal presence:
+### Step 5: Audio Sampling & SNR Verification
+Capture a demodulated segment to verify signal presence:
 - Call `sdr_get_audio(duration_sec=5.0)`.
 - Inspect return values:
   - `path`: Location of the recorded WAV file (typically `/tmp/sdr_sample.wav`).
   - `rms`: Root-Mean-Square audio amplitude. If `rms < 10.0`, the channel is dead silence or weak background hiss. If `rms > 50.0`, speech/music is clearly audible.
   - `peak`: Peak sample value.
 
-### Step 5: Auditory Deduction (Multimodal Station ID)
+### Step 6: Auditory Deduction (Multimodal Station ID)
 Inspect the audio file directly (using multimodal audio models or audio inspection tools) to extract clues:
 - **Spoken Language**: Mandarin, Korean, Japanese, English, Russian, Arabic, Spanish, etc.
 - **Acoustic Signatures**: Time pips (hourly chimes), interval signal tunes (music box melodies), fanfare, distinctive jingles.
 - **Content Type**: News broadcast, commentary, revolutionary music, commercial advertisements, amateur callsign exchange.
 - **Reference HF Schedules**: Correlate frequency with known international HF schedules (AOKI / HFCC / EiBi).
 
-### Step 6: Closed-Loop UI Feedback
+### Step 7: Closed-Loop UI Feedback
 Push the deduction back to the user's SDR++ screen so the operator can view the AI results:
 - Call `sdr_update_analysis(country=..., language=..., station=..., program=..., confidence=..., evidence=[...], dialect=...)`.
 - The SDR++ ImGui Agent Console will immediately update its display with your analysis.
@@ -135,6 +143,7 @@ Push the deduction back to the user's SDR++ screen so the operator can view the 
 | `sdr_status` | None | Queries receiver state, connection, and audio stream status. | `frequency`, `mode`, `connected`, `audio_ready`, `backend` |
 | `sdr_devices` | None | Lists available radio hardware sources. | `available_sources`, `active_device` |
 | `sdr_scan` | `start_frequency`, `end_frequency`, `step_hz=None`, `dwell_ms=150.0`, `mode=None`, `min_snr_db=6.0` | Autonomous RF spectrum sweep. Detects, clusters, and deduplicates candidate signals with state restoration. | `success`, `candidates: List[ScanCandidate]`, `window_count`, `noise_floor_db` |
+| `sdr_screen_signals` | `candidates=None`, `max_probes=12`, `probe_duration_sec=1.0`, `min_score_threshold=0.35`, `preserve_uncertain=True` | Algorithmic pre-screening of raw candidates into a compact list of active broadcasts (Recall-First). | `success`, `signals: List[ScreenedSignal]`, `probed_count`, `retained_count` |
 | `sdr_tune` | `frequency: float`, `mode: str = None` | Tunes SDR to center frequency in Hz and optional mode (`AM`, `WFM`, `NFM`, `USB`, `LSB`, `CW`). | `success`, `frequency`, `mode` |
 | `sdr_get_spectrum` | `bin_count: int = 256` | Returns real-time RF power spectrum FFT in dB across instantaneous passband. | `available`, `bins`, `peak_db`, `peak_frequency`, `avg_db` |
 | `sdr_get_audio` | `duration_sec: float = 5.0`, `frequency: float = None`, `mode: str = None` | Samples demodulated audio to a WAV file with RMS and peak metrics. | `success`, `path`, `sample_rate`, `rms`, `peak` |

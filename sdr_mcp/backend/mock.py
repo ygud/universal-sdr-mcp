@@ -22,6 +22,8 @@ from sdr_mcp.backend.base import (
     RecordingInfo,
     ScanCandidate,
     ScanResult,
+    ScreenedSignal,
+    ScreenResult,
 )
 from sdr_mcp.detector import (
     estimate_noise_floor,
@@ -30,12 +32,20 @@ from sdr_mcp.detector import (
     deduplicate_candidates,
     filter_scan_range,
 )
+from sdr_mcp.screener import (
+    AudioFeature,
+    RFFeature,
+    extract_audio_features,
+    extract_rf_features,
+    compute_scores_and_classify,
+    rank_and_select_candidates,
+)
 
 DEFAULT_SYNTHETIC_SIGNALS = [
-    {"frequency": 11204000.0, "power_db": -42.0, "bandwidth_hz": 9000.0, "sidebands": [(-2500, -58.0), (2500, -58.0)]},
-    {"frequency": 11760000.0, "power_db": -55.0, "bandwidth_hz": 6000.0, "sidebands": []},
-    {"frequency": 11960000.0, "power_db": -68.0, "bandwidth_hz": 5000.0, "sidebands": []},
-    {"frequency": 14200000.0, "power_db": -48.0, "bandwidth_hz": 3000.0, "sidebands": []},
+    {"frequency": 11204000.0, "power_db": -42.0, "bandwidth_hz": 9000.0, "sidebands": [(-2500, -58.0), (2500, -58.0)], "signal_type": "broadcast"},
+    {"frequency": 11760000.0, "power_db": -55.0, "bandwidth_hz": 6000.0, "sidebands": [], "signal_type": "broadcast"},
+    {"frequency": 11960000.0, "power_db": -68.0, "bandwidth_hz": 5000.0, "sidebands": [], "signal_type": "weak"},
+    {"frequency": 14200000.0, "power_db": -48.0, "bandwidth_hz": 3000.0, "sidebands": [], "signal_type": "carrier_only"},
 ]
 
 
@@ -53,10 +63,12 @@ class MockBackend(SDRBackend):
 
         # Scanning and concurrency lock
         self._is_scanning = False
+        self._is_probing = False
         self._scan_lock = threading.Lock()
         self._scan_status: Dict[str, Any] = {}
         self._fail_tune_freq: Optional[float] = None
         self._synthetic_signals: List[Dict[str, Any]] = [s.copy() for s in DEFAULT_SYNTHETIC_SIGNALS]
+        self._last_scan_candidates: List[Dict[str, Any]] = []
 
         # Recording state
         self._is_recording = False
@@ -128,8 +140,8 @@ class MockBackend(SDRBackend):
         if not self._connected:
             return {"backend": self.name, "success": False, "error": "Mock backend disconnected"}
 
-        if self._is_scanning and not internal:
-            return {"backend": self.name, "success": False, "error": "SDR is currently busy scanning"}
+        if (self._is_scanning or self._is_probing) and not internal:
+            return {"backend": self.name, "success": False, "error": "SDR is currently busy scanning or probing"}
 
         if self._fail_tune_freq is not None and abs(frequency - self._fail_tune_freq) < 1000.0:
             return {"backend": self.name, "success": False, "error": f"Simulated tune failure at {frequency} Hz"}
@@ -251,6 +263,7 @@ class MockBackend(SDRBackend):
         duration_sec: float = 5.0,
         frequency: Optional[float] = None,
         mode: Optional[str] = None,
+        internal: bool = False,
     ) -> AudioSegment:
         if not self._connected:
             return AudioSegment(
@@ -265,7 +278,7 @@ class MockBackend(SDRBackend):
                 error="Mock backend disconnected",
             )
 
-        if self._is_scanning:
+        if (self._is_scanning or self._is_probing) and not internal:
             return AudioSegment(
                 success=False,
                 path="",
@@ -275,11 +288,11 @@ class MockBackend(SDRBackend):
                 samples_recorded=0,
                 backend=self.name,
                 simulated=True,
-                error="SDR is currently busy scanning",
+                error="SDR is currently busy scanning or probing",
             )
 
         if frequency is not None:
-            t_res = self.tune(frequency, mode)
+            t_res = self.tune(frequency, mode, internal=internal)
             if not t_res.get("success", False):
                 return AudioSegment(
                     success=False,
@@ -297,13 +310,49 @@ class MockBackend(SDRBackend):
         num_samples = int(duration_sec * sample_rate)
         out_path = "/tmp/mock_sdr_audio.wav"
 
-        # Generate synthetic 48kHz mono tone (440Hz + subtle noise)
-        tone_freq = 440.0
+        # Check proximity to configured synthetic signals
+        target_sig = None
+        for s in self._synthetic_signals:
+            if abs(self._frequency - s["frequency"]) < 10000.0:
+                target_sig = s
+                break
+
+        sig_type = target_sig.get("signal_type", "broadcast") if target_sig else "noise"
         samples = []
-        for i in range(num_samples):
-            t = i / sample_rate
-            val = int(8000.0 * math.sin(2.0 * math.pi * tone_freq * t) + random.uniform(-500.0, 500.0))
-            samples.append(max(-32768, min(32767, val)))
+
+        if sig_type == "broadcast":
+            # Modulated speech-like envelope with 3.2 Hz syllable rhythm (CV ~0.065)
+            for i in range(num_samples):
+                t = i / sample_rate
+                env = 0.55 + 0.35 * math.sin(2.0 * math.pi * 3.2 * t)
+                if (int(t * 1.8) % 3) == 0:
+                    env *= 0.35
+                tone = math.sin(2.0 * math.pi * 440.0 * t) + 0.35 * math.sin(2.0 * math.pi * 880.0 * t)
+                val = int(env * 14000.0 * tone + random.gauss(0, 400.0))
+                samples.append(max(-32768, min(32767, val)))
+        elif sig_type == "carrier_only":
+            # Pure unmodulated carrier: flat low noise floor, CV < 0.03
+            for i in range(num_samples):
+                val = int(random.gauss(0, 250.0))
+                samples.append(max(-32768, min(32767, val)))
+        elif sig_type == "pause":
+            # Short speech pause: carrier present, audio low
+            for i in range(num_samples):
+                val = int(random.gauss(0, 350.0))
+                samples.append(max(-32768, min(32767, val)))
+        elif sig_type == "weak":
+            # Weak broadcast signal with lower SNR
+            for i in range(num_samples):
+                t = i / sample_rate
+                env = 0.50 + 0.25 * math.sin(2.0 * math.pi * 2.5 * t)
+                tone = math.sin(2.0 * math.pi * 550.0 * t)
+                val = int(env * 3500.0 * tone + random.gauss(0, 1800.0))
+                samples.append(max(-32768, min(32767, val)))
+        else:
+            # White noise / empty channel: flat Gaussian noise, CV around 0.025
+            for i in range(num_samples):
+                val = int(random.gauss(0, 4500.0))
+                samples.append(max(-32768, min(32767, val)))
 
         raw_bytes = struct.pack(f"<{len(samples)}h", *samples)
         with wave.open(out_path, "wb") as w:
@@ -601,6 +650,7 @@ class MockBackend(SDRBackend):
             ]
 
             if is_success:
+                self._last_scan_candidates = list(candidate_dicts)
                 self.update_scan_status(
                     status="COMPLETE",
                     scanning=False,
@@ -659,3 +709,149 @@ class MockBackend(SDRBackend):
                     )
             finally:
                 self._is_scanning = False
+
+    def screen_candidates(
+        self,
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        max_probes: int = 12,
+        probe_duration_sec: float = 1.0,
+        min_score_threshold: float = 0.35,
+        preserve_uncertain: bool = True,
+    ) -> ScreenResult:
+        """Algorithmic pre-screening of raw scan candidates down to high-value signals."""
+        if self._is_scanning or self._is_probing:
+            return ScreenResult(
+                success=False,
+                probed_count=0,
+                retained_count=0,
+                duration_sec=0.0,
+                error="Hardware busy: SDR scan or probe in progress",
+            )
+
+        start_time = time.time()
+
+        # Resolve candidate pool
+        cand_pool = candidates if candidates is not None else list(self._last_scan_candidates)
+        if not cand_pool:
+            return ScreenResult(
+                success=True,
+                probed_count=0,
+                retained_count=0,
+                duration_sec=round(time.time() - start_time, 2),
+                signals=[],
+                details={"note": "No candidate signals provided or cached"},
+            )
+
+        # Pure RF mathematical prior ranking and selection
+        selected = rank_and_select_candidates(
+            cand_pool, max_probes=max_probes, min_spacing_hz=8000.0
+        )
+        if not selected:
+            return ScreenResult(
+                success=True,
+                probed_count=0,
+                retained_count=0,
+                duration_sec=round(time.time() - start_time, 2),
+                signals=[],
+            )
+
+        # Save original receiver status for 100% restoration guarantee
+        orig_status = self.get_status()
+        orig_freq = orig_status.frequency
+        orig_mode = orig_status.mode
+
+        self._is_probing = True
+        probed_signals: List[ScreenedSignal] = []
+
+        try:
+            for c in selected:
+                freq = float(c["frequency"])
+                t_res = self.tune(freq, mode="AM", center=False, internal=True)
+                if not t_res.get("success", False):
+                    continue  # Failure isolation: never reuse stale data
+
+                # Local spectrum re-acquisition
+                spec = self.get_spectrum(bin_count=256)
+                if not spec.available or not spec.bins:
+                    continue
+                step_hz = (spec.bandwidth / len(spec.bins)) if len(spec.bins) > 0 else 7812.5
+                rf_feat = extract_rf_features(
+                    bins=spec.bins,
+                    target_freq=freq,
+                    start_freq=spec.start_frequency,
+                    step_hz=step_hz,
+                )
+
+                # Demodulated audio probe
+                aud = self.get_audio(duration_sec=probe_duration_sec, internal=True)
+                if not aud.success:
+                    continue
+                audio_feat = extract_audio_features(aud.path)
+
+                # Multi-evidence fusion and classification
+                b_score, conf, classification, rec = compute_scores_and_classify(
+                    rf_feat, audio_feat
+                )
+
+                signal_obj = ScreenedSignal(
+                    frequency=freq,
+                    frequency_khz=round(freq / 1e3, 1),
+                    classification=classification,
+                    broadcast_score=b_score,
+                    confidence=conf,
+                    rf_evidence={
+                        "local_snr_db": rf_feat.local_snr_db,
+                        "prominence_db": rf_feat.prominence_db,
+                        "power_db": rf_feat.power_db,
+                        "symmetry_score": rf_feat.symmetry_score,
+                        "rf_score": rf_feat.score,
+                    },
+                    audio_evidence={
+                        "rms": audio_feat.rms,
+                        "envelope_cv": audio_feat.envelope_cv,
+                        "dynamic_range_db": audio_feat.dynamic_range_db,
+                        "zcr_mean": audio_feat.zcr_mean,
+                        "zcr_std": audio_feat.zcr_std,
+                        "audio_score": audio_feat.score,
+                    },
+                    temporal_evidence=None,  # Reserved for v0.2
+                    recommendation=rec,
+                )
+                probed_signals.append(signal_obj)
+
+        finally:
+            # RESTORATION GUARANTEE: unconditionally restore original receiver state
+            try:
+                if orig_freq > 0:
+                    self.tune(orig_freq, mode=orig_mode, center=False, internal=True)
+            finally:
+                self._is_probing = False
+
+        # Recall-First filtering policy
+        retained: List[ScreenedSignal] = []
+        for s in probed_signals:
+            if s.classification == "BROADCAST_ACTIVE":
+                retained.append(s)
+            elif s.classification == "UNCERTAIN" and preserve_uncertain:
+                retained.append(s)
+            elif s.classification == "CARRIER_ONLY" and s.broadcast_score >= min_score_threshold:
+                retained.append(s)
+            # NOISE_STATIC and low-score CARRIER_ONLY are filtered out
+
+        # Sort retained descending by broadcast_score
+        retained.sort(key=lambda x: x.broadcast_score, reverse=True)
+        elapsed = round(time.time() - start_time, 2)
+
+        return ScreenResult(
+            success=True,
+            probed_count=len(probed_signals),
+            retained_count=len(retained),
+            duration_sec=elapsed,
+            signals=retained,
+            details={
+                "probed_candidates": len(probed_signals),
+                "max_probes": max_probes,
+                "min_score_threshold": min_score_threshold,
+                "preserve_uncertain": preserve_uncertain,
+            },
+        )

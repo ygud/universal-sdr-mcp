@@ -112,6 +112,38 @@ class ScanResult:
         return d
 
 
+@dataclass
+class ScreenedSignal:
+    frequency: float
+    frequency_khz: float
+    classification: str  # "BROADCAST_ACTIVE", "UNCERTAIN", "CARRIER_ONLY", "NOISE_STATIC"
+    broadcast_score: float  # 0.0 to 1.0
+    confidence: float  # 0.0 to 1.0
+    rf_evidence: Dict[str, Any]
+    audio_evidence: Dict[str, Any]
+    temporal_evidence: Optional[Dict[str, Any]] = None  # Reserved for v0.2
+    recommendation: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ScreenResult:
+    success: bool
+    probed_count: int
+    retained_count: int
+    duration_sec: float
+    signals: List[ScreenedSignal] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["signals"] = [s.to_dict() if hasattr(s, "to_dict") else s for s in self.signals]
+        return d
+
+
 class SDRBackend(ABC):
     """Abstract interface for all SDR control and data backends."""
 
@@ -220,4 +252,16 @@ class SDRBackend(ABC):
     ) -> Dict[str, Any]:
         """Update UI / console with scan status, progress, or completed candidate results."""
         return {"backend": self.name, "supported": False}
+
+    @abstractmethod
+    def screen_candidates(
+        self,
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        max_probes: int = 12,
+        probe_duration_sec: float = 1.0,
+        min_score_threshold: float = 0.35,
+        preserve_uncertain: bool = True,
+    ) -> ScreenResult:
+        """Algorithmic pre-screening of raw scan candidates down to high-value signals."""
+        pass
 

@@ -40,6 +40,7 @@ def detect_peaks_in_window(
     noise_floor_db: float,
     min_snr_db: float = 6.0,
     threshold_db: Optional[float] = None,
+    mask_dc_bins: int = 0,
 ) -> List[Dict[str, Any]]:
     """Detect local maxima peaks exceeding noise floor and optional threshold.
     
@@ -50,6 +51,7 @@ def detect_peaks_in_window(
         noise_floor_db: Estimated noise floor in dB.
         min_snr_db: Minimum estimated SNR (power - noise_floor) in dB.
         threshold_db: Optional absolute minimum power in dB.
+        mask_dc_bins: Number of bins around center (n // 2) to ignore for zero-IF DC offset suppression.
     
     Returns:
         List of raw peak dictionaries with frequency, power_db, estimated_snr_db, bin_idx.
@@ -59,7 +61,11 @@ def detect_peaks_in_window(
     if n < 3:
         return peaks
 
+    center_idx = n // 2
     for i in range(1, n - 1):
+        if mask_dc_bins > 0 and abs(i - center_idx) <= mask_dc_bins:
+            continue
+
         pwr = bins[i]
         # Local maximum check
         if pwr <= bins[i - 1] or pwr < bins[i + 1]:
